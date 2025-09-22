@@ -1,48 +1,91 @@
-import os
 import json
+import os
+import random
+import time
+from typing import List, Optional
+
 import google.generativeai as genai
-from typing import List
 from dotenv import load_dotenv
-from .models import ProfileData, VerificationReport, TrustScore, Discrepancy, Platform
+
+from .models import Discrepancy, Platform, ProfileData, TrustScore, VerificationReport
 
 load_dotenv()
 
+
 class GeminiAnalyzer:
     """Analyzes profile data using Google Gemini API"""
-    
-    def __init__(self):
-        api_key = os.getenv('GEMINI_API_KEY')
+
+    def __init__(self, model_name: str = "gemini-1.5-pro", max_retries: int = 3):
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY not found in environment variables")
-        
+
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-pro')
-    
+        self.model = genai.GenerativeModel(model_name)
+        self.max_retries = max_retries
+
     def analyze_profiles(self, profiles: List[ProfileData]) -> VerificationReport:
         """Analyze multiple profiles and generate verification report"""
-        
+
         # Prepare data for Gemini
         profiles_json = []
         for profile in profiles:
             profiles_json.append(profile.model_dump())
-        
+
         prompt = self._build_analysis_prompt(profiles_json)
-        
-        try:
-            response = self.model.generate_content(prompt)
-            analysis_result = self._parse_gemini_response(response.text, profiles)
-            
-            return analysis_result
-            
-        except Exception as e:
-            print(f"Error analyzing profiles with Gemini: {e}")
-            # Return fallback analysis
-            return self._create_fallback_report(profiles)
-    
+
+        # Try with retry logic
+        for attempt in range(self.max_retries):
+            try:
+                response = self._call_gemini_with_retry(prompt, attempt)
+                analysis_result = self._parse_gemini_response(response.text, profiles)
+                return analysis_result
+
+            except Exception as e:
+                if attempt == self.max_retries - 1:  # Last attempt
+                    print("❌ Final attempt failed. Using fallback analysis.")
+                    print(f"Error: {str(e)}")
+                    return self._create_fallback_report(profiles, str(e))
+                else:
+                    print(f"⚠️  Attempt {attempt + 1} failed, retrying...")
+                    self._handle_api_error(e, attempt)
+
+        return self._create_fallback_report(profiles)
+
+    def _call_gemini_with_retry(self, prompt: str, attempt: int) -> any:
+        """Call Gemini API with exponential backoff"""
+        if attempt > 0:
+            # Exponential backoff with jitter
+            delay = (2**attempt) + random.uniform(0, 1)
+            print(f"⏳ Waiting {delay:.1f}s before retry...")
+            time.sleep(delay)
+
+        return self.model.generate_content(prompt)
+
+    def _handle_api_error(self, error: Exception, attempt: int) -> None:
+        """Handle different types of API errors with appropriate messaging"""
+        error_str = str(error).lower()
+
+        if "quota" in error_str or "429" in error_str:
+            if "free tier" in error_str:
+                print(
+                    "🔄 Free tier quota exceeded. Consider upgrading or switching to gemini-1.5-flash."
+                )
+            else:
+                print("🔄 Rate limit hit. Implementing backoff strategy...")
+        elif "401" in error_str or "authentication" in error_str:
+            print("🔑 Authentication error. Please check your GEMINI_API_KEY.")
+            raise error  # Don't retry auth errors
+        elif "400" in error_str:
+            print("📝 Bad request. Input may be too large or malformed.")
+        else:
+            print(f"🌐 Network or API error: {str(error)[:100]}...")
+
     def _build_analysis_prompt(self, profiles_data: List[dict]) -> str:
         """Build structured prompt for Gemini analysis"""
-        
-        prompt = """You are a social profile verification system designed to analyze and cross-verify user profiles across multiple platforms.
+
+        prompt = (
+            """You are a social profile verification system designed to analyze and cross-verify user profiles across multiple platforms.
 
 TASK: Analyze the following normalized profile data and provide a comprehensive verification report.
 
@@ -57,7 +100,9 @@ ANALYSIS GOALS:
 
 PROFILE DATA:
 ```json
-""" + json.dumps(profiles_data, indent=2) + """
+"""
+            + json.dumps(profiles_data, indent=2)
+            + """
 ```
 
 Please provide your analysis in the following JSON format (ensure valid JSON syntax):
@@ -104,79 +149,102 @@ ANALYSIS GUIDELINES:
 - Consider follower counts, verification status, content quality, and cross-platform consistency
 - Highlight both positive and negative indicators
 - Provide specific examples and citations from the data"""
+        )
 
         return prompt
-    
-    def _parse_gemini_response(self, response_text: str, profiles: List[ProfileData]) -> VerificationReport:
+
+    def _parse_gemini_response(
+        self, response_text: str, profiles: List[ProfileData]
+    ) -> VerificationReport:
         """Parse Gemini's JSON response into VerificationReport"""
-        
+
         try:
             # Extract JSON from response (handle markdown code blocks)
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            
+            json_start = response_text.find("{")
+            json_end = response_text.rfind("}") + 1
+
             if json_start >= 0 and json_end > json_start:
                 json_str = response_text[json_start:json_end]
                 data = json.loads(json_str)
-                
+
                 # Parse discrepancies
                 discrepancies = []
-                for disc in data.get('discrepancies', []):
-                    discrepancies.append(Discrepancy(
-                        field=disc['field'],
-                        platforms=[Platform(p) for p in disc['platforms']],
-                        values={Platform(k): v for k, v in disc['values'].items()},
-                        severity=disc['severity']
-                    ))
-                
+                for disc in data.get("discrepancies", []):
+                    discrepancies.append(
+                        Discrepancy(
+                            field=disc["field"],
+                            platforms=[Platform(p) for p in disc["platforms"]],
+                            values={Platform(k): v for k, v in disc["values"].items()},
+                            severity=disc["severity"],
+                        )
+                    )
+
                 # Create trust score
-                trust_data = data.get('trust_score', {})
+                trust_data = data.get("trust_score", {})
                 trust_score = TrustScore(
-                    overall=trust_data.get('overall', 50),
-                    reputation=trust_data.get('reputation', 50),
-                    consistency=trust_data.get('consistency', 50),
-                    content_quality=trust_data.get('content_quality', 50)
+                    overall=trust_data.get("overall", 50),
+                    reputation=trust_data.get("reputation", 50),
+                    consistency=trust_data.get("consistency", 50),
+                    content_quality=trust_data.get("content_quality", 50),
                 )
-                
+
                 return VerificationReport(
                     trust_score=trust_score,
                     profiles_analyzed=profiles,
-                    consistency_score=data.get('consistency_score', 50),
+                    consistency_score=data.get("consistency_score", 50),
                     discrepancies=discrepancies,
-                    red_flags=data.get('red_flags', []),
-                    strengths=data.get('strengths', []),
-                    citations=data.get('citations', []),
-                    analysis_summary=data.get('analysis_summary', ''),
-                    same_person_confidence=data.get('same_person_confidence', 50)
+                    red_flags=data.get("red_flags", []),
+                    strengths=data.get("strengths", []),
+                    citations=data.get("citations", []),
+                    analysis_summary=data.get("analysis_summary", ""),
+                    same_person_confidence=data.get("same_person_confidence", 50),
                 )
-            
+
         except Exception as e:
             print(f"Error parsing Gemini response: {e}")
-        
+
         return self._create_fallback_report(profiles)
-    
-    def _create_fallback_report(self, profiles: List[ProfileData]) -> VerificationReport:
+
+    def _create_fallback_report(
+        self, profiles: List[ProfileData], error_msg: Optional[str] = None
+    ) -> VerificationReport:
         """Create a basic fallback report when Gemini analysis fails"""
-        
+
         trust_score = TrustScore(
-            overall=50,
-            reputation=50,
-            consistency=50,
-            content_quality=50
+            overall=50, reputation=50, consistency=50, content_quality=50
         )
-        
+
         # Basic consistency check
         names = [p.name for p in profiles if p.name]
         consistency = 80 if len(set(names)) <= 1 else 30
-        
+
+        # Enhanced fallback with basic analysis
+        red_flags = ["AI analysis unavailable - using basic assessment"]
+        strengths = ["Multiple platforms present"]
+
+        if error_msg and "quota" in error_msg.lower():
+            red_flags.append("Consider upgrading Gemini API plan for full analysis")
+
+        # Basic consistency checks
+        if len(profiles) > 1:
+            names = [p.name for p in profiles if p.name]
+            if len(set(names)) > 1:
+                red_flags.append("Different names detected across profiles")
+                consistency = 30
+
+            handles = [p.handle for p in profiles if p.handle]
+            if len({h.lower().replace("@", "") for h in handles}) == 1:
+                strengths.append("Consistent usernames across platforms")
+                consistency = max(consistency, 70)
+
         return VerificationReport(
             trust_score=trust_score,
             profiles_analyzed=profiles,
             consistency_score=consistency,
             discrepancies=[],
-            red_flags=["Analysis unavailable - using fallback assessment"],
-            strengths=["Multiple platforms present"],
+            red_flags=red_flags,
+            strengths=strengths,
             citations=[],
-            analysis_summary="Fallback analysis due to API error. Manual review recommended.",
-            same_person_confidence=50
+            analysis_summary=f"Fallback analysis due to API limitation. {len(profiles)} profiles analyzed with basic consistency checks. Full AI analysis requires API access.",
+            same_person_confidence=consistency,
         )

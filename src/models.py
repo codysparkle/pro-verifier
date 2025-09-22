@@ -1,6 +1,8 @@
-from pydantic import BaseModel, Field, HttpUrl
-from typing import List, Optional, Dict, Any
 from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field, HttpUrl
+
 
 class Platform(str, Enum):
     LINKEDIN = "linkedin"
@@ -8,8 +10,10 @@ class Platform(str, Enum):
     INSTAGRAM = "instagram"
     GITHUB = "github"
 
+
 class ProfileData(BaseModel):
     """Normalized profile data schema"""
+
     platform: Platform
     handle: str
     name: Optional[str] = None
@@ -27,27 +31,35 @@ class ProfileData(BaseModel):
     email: Optional[str] = None
     additional_data: Dict[str, Any] = Field(default_factory=dict)
 
+
 class VerificationRequest(BaseModel):
     """Input request for profile verification"""
+
     profiles: List[HttpUrl]
     user_id: Optional[str] = None
 
+
 class TrustScore(BaseModel):
     """Trust score breakdown"""
+
     overall: int = Field(..., ge=0, le=100)
     reputation: int = Field(..., ge=0, le=100)
     consistency: int = Field(..., ge=0, le=100)
     content_quality: int = Field(..., ge=0, le=100)
 
+
 class Discrepancy(BaseModel):
     """Identified discrepancy between profiles"""
+
     field: str
     platforms: List[Platform]
     values: Dict[Platform, str]
     severity: str  # "low", "medium", "high"
 
+
 class VerificationReport(BaseModel):
     """Final verification report"""
+
     trust_score: TrustScore
     profiles_analyzed: List[ProfileData]
     consistency_score: int = Field(..., ge=0, le=100)
