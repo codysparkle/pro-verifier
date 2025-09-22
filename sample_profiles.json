@@ -1,0 +1,6 @@
+{
+  "profiles": [
+    "https://github.com/octocat",
+    "https://github.com/torvalds"
+  ]
+}
